@@ -1,0 +1,295 @@
+pipeline {
+    agent any
+    environment {
+        PROJECT_NAME = 'your-project-name'
+        ECR_REGISTRY = '${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/'
+        APP_ENV = 'qa'
+        SERVICE_NAME = 'api-service'
+        
+        // Docker image naming conventions
+        DOCKER_IMAGE = "${ECR_REGISTRY}${PROJECT_NAME}:${APP_ENV}"
+        PROXY_DOCKER_IMAGE = "${ECR_REGISTRY}${PROJECT_NAME}-proxy:${APP_ENV}"
+        
+        // ECS Configuration
+        ECS_CLUSTER = 'your-ecs-cluster-name'
+        TASK_DEF_NAME = "${SERVICE_NAME}-${APP_ENV}"
+        
+        // Dockerfiles
+        DOCKERFILE = './Dockerfile'
+        PROXY_DOCKERFILE = './Dockerfile.nginx'
+        
+        // AWS Configuration
+        AWS_REGION = 'us-east-1'
+        
+        // Slack Notification Configuration
+        SLACK_CHANNEL = '#deployment-notifications'
+    }
+    
+    stages {
+        stage('Prepare') {
+            steps {
+                script {
+                    // Send Slack notification for pipeline start
+                    slackSend(
+                        channel: "${SLACK_CHANNEL}",
+                        color: 'good',
+                        message: "Pipeline Started: *${env.JOB_NAME}* - Build #${env.BUILD_NUMBER}\n" +
+                                "Branch: ${env.GIT_BRANCH}\n" +
+                                "Initiated by: ${env.BUILD_USER_ID ?: 'Automated'}"
+                    )
+                }
+            }
+        }
+        
+        stage('Build PHP Docker Image') {   
+            steps {
+                script {
+                    try {
+                        echo "Building PHP Docker Image for ${SERVICE_NAME}"
+                        sh """
+                            docker build -t ${DOCKER_IMAGE} -f ${DOCKERFILE} .
+                        """
+                        
+                        // Send Slack notification for successful build
+                        slackSend(
+                            channel: "${SLACK_CHANNEL}",
+                            color: 'good',
+                            message: "PHP Docker Image Built Successfully: *${DOCKER_IMAGE}*"
+                        )
+                    } catch (Exception e) {
+                        // Send Slack notification for build failure
+                        slackSend(
+                            channel: "${SLACK_CHANNEL}",
+                            color: 'danger',
+                            message: "PHP Docker Image Build Failed: *${DOCKER_IMAGE}*\n" +
+                                    "Error: ${e.getMessage()}"
+                        )
+                        throw e
+                    }
+                }
+            }
+        }
+        
+        stage('Build Proxy Docker Image') {
+            steps {
+                script {
+                    try {
+                        echo "Building Proxy Docker Image"
+                        sh """
+                            docker build -t ${PROXY_DOCKER_IMAGE} -f ${PROXY_DOCKERFILE} .
+                        """
+                        
+                        // Send Slack notification for successful build
+                        slackSend(
+                            channel: "${SLACK_CHANNEL}",
+                            color: 'good',
+                            message: "Proxy Docker Image Built Successfully: *${PROXY_DOCKER_IMAGE}*"
+                        )
+                    } catch (Exception e) {
+                        // Send Slack notification for build failure
+                        slackSend(
+                            channel: "${SLACK_CHANNEL}",
+                            color: 'danger',
+                            message: "Proxy Docker Image Build Failed: *${PROXY_DOCKER_IMAGE}*\n" +
+                                    "Error: ${e.getMessage()}"
+                        )
+                        throw e
+                    }
+                }
+            }
+        }
+        
+        stage('Push Docker Images') {
+            steps {
+                script {
+                    try {
+                        withAWS(credentials: 'aws-ecr-credentials') {
+                            echo "Pushing Docker images to ECR"
+                            sh """
+                                aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                                docker push ${DOCKER_IMAGE}
+                                docker push ${PROXY_DOCKER_IMAGE}
+                            """
+                        }
+                        
+                        // Send Slack notification for successful push
+                        slackSend(
+                            channel: "${SLACK_CHANNEL}",
+                            color: 'good',
+                            message: "Docker Images Pushed Successfully:\n" +
+                                    "- *${DOCKER_IMAGE}*\n" +
+                                    "- *${PROXY_DOCKER_IMAGE}*"
+                        )
+                    } catch (Exception e) {
+                        // Send Slack notification for push failure
+                        slackSend(
+                            channel: "${SLACK_CHANNEL}",
+                            color: 'danger',
+                            message: "Docker Images Push Failed\n" +
+                                    "Error: ${e.getMessage()}"
+                        )
+                        throw e
+                    }
+                }
+            }
+        }
+        
+        stage('Update ECS Task Definition') {
+            steps {
+                script {
+                    try {
+                        def taskDefFile = './devops/taskdefinition/task-definition-qa.json'
+                        echo "Registering new ECS task definition from ${taskDefFile}"
+                        
+                        def newTaskDefArn = sh(script: """
+                            aws ecs register-task-definition --cli-input-json file://${taskDefFile} --query 'taskDefinition.taskDefinitionArn' --output text
+                        """, returnStdout: true).trim()
+                        
+                        echo "New task definition registered: ${newTaskDefArn}"
+                        env.NEW_TASK_DEF_ARN = newTaskDefArn
+                        
+                        // Send Slack notification for successful task definition update
+                        slackSend(
+                            channel: "${SLACK_CHANNEL}",
+                            color: 'good',
+                            message: "ECS Task Definition Updated Successfully\n" +
+                                    "New Task Definition ARN: *${newTaskDefArn}*"
+                        )
+                    } catch (Exception e) {
+                        // Send Slack notification for task definition update failure
+                        slackSend(
+                            channel: "${SLACK_CHANNEL}",
+                            color: 'danger',
+                            message: "ECS Task Definition Update Failed\n" +
+                                    "Error: ${e.getMessage()}"
+                        )
+                        throw e
+                    }
+                }
+            }
+        }
+        
+        stage('Approval Before Deploy') {
+            steps {
+                script {
+                    // Send Slack notification for deployment approval
+                    slackSend(
+                        channel: "${SLACK_CHANNEL}",
+                        color: 'warning',
+                        message: "Deployment Awaiting Approval\n" +
+                                "Job: *${env.JOB_NAME}* - Build #${env.BUILD_NUMBER}\n" +
+                                "Requires Manual Intervention"
+                    )
+                    
+                    def userInput = input(
+                        message: 'Do you want to proceed with the ECS service update?',
+                        ok: 'Yes',
+                        parameters: [
+                            choice(choices: ['yes', 'no'], description: 'Proceed with ECS deployment?', name: 'Proceed')
+                        ]
+                    )
+                    
+                    if (userInput == 'no') {
+                        // Send Slack notification for deployment cancellation
+                        slackSend(
+                            channel: "${SLACK_CHANNEL}",
+                            color: 'warning',
+                            message: "Deployment Cancelled\n" +
+                                    "Job: *${env.JOB_NAME}* - Build #${env.BUILD_NUMBER}"
+                        )
+                        error("Deployment aborted by user.")
+                    }
+                }
+            }
+        }
+        
+        stage('Update ECS Service') {
+            steps {
+                script {
+                    try {
+                        echo "Updating ECS service ${SERVICE_NAME} in cluster ${ECS_CLUSTER}"
+                        sh """
+                            aws ecs update-service \
+                                --cluster ${ECS_CLUSTER} \
+                                --service ${SERVICE_NAME} \
+                                --task-definition ${env.NEW_TASK_DEF_ARN} \
+                                --force-new-deployment \
+                                --region ${AWS_REGION}
+                        """
+                        
+                        // Send Slack notification for successful deployment
+                        slackSend(
+                            channel: "${SLACK_CHANNEL}",
+                            color: 'good',
+                            message: "ECS Service Deployment Successful\n" +
+                                    "Service: *${SERVICE_NAME}*\n" +
+                                    "Cluster: *${ECS_CLUSTER}*\n" +
+                                    "Task Definition: *${env.NEW_TASK_DEF_ARN}*"
+                        )
+                    } catch (Exception e) {
+                        // Send Slack notification for deployment failure
+                        slackSend(
+                            channel: "${SLACK_CHANNEL}",
+                            color: 'danger',
+                            message: "ECS Service Deployment Failed\n" +
+                                    "Service: *${SERVICE_NAME}*\n" +
+                                    "Error: ${e.getMessage()}"
+                        )
+                        throw e
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+        }
+        
+        success {
+            script {
+                // Final success notification
+                slackSend(
+                    channel: "${SLACK_CHANNEL}",
+                    color: 'good',
+                    message: "Pipeline Completed Successfully\n" +
+                            "Job: *${env.JOB_NAME}* - Build #${env.BUILD_NUMBER}\n" +
+                            "Duration: *${currentBuild.durationString}*"
+                )
+            }
+        }
+        
+        failure {
+            script {
+                // Final failure notification
+                slackSend(
+                    channel: "${SLACK_CHANNEL}",
+                    color: 'danger',
+                    message: "Pipeline Failed\n" +
+                            "Job: *${env.JOB_NAME}* - Build #${env.BUILD_NUMBER}\n" +
+                            "Duration: *${currentBuild.durationString}*"
+                )
+            }
+        }
+        
+        cleanup {
+            script {
+                echo 'Cleaning up Docker images...'
+                sh """
+                    docker rmi ${DOCKER_IMAGE} || true
+                    docker rmi ${PROXY_DOCKER_IMAGE} || true
+                    docker system prune -f || true
+                """
+                
+                // Send Slack notification for cleanup
+                slackSend(
+                    channel: "${SLACK_CHANNEL}",
+                    color: 'good',
+                    message: "Cleanup Completed\n" +
+                            "Removed Docker Images and Pruned System"
+                )
+            }
+        }
+    }
+}
